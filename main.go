@@ -11,12 +11,6 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-// Замените на ваш токен бота
-const BotToken = "MTM0ODU3MDAzNTM0MTIzNDE4Nw.GMaKW2.74WNj65pTnC1GtoiqP-9YMg9aq2M3MKcZqzZYc"
-
-// ID голосового канала, в который пользователи заходят для создания временного канала
-const JoinChannelID = "906124525492641828"
-
 // Храним созданные временные каналы: ключ – ID канала, значение – ID гильдии
 var tempChannels = make(map[string]string)
 
