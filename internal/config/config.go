@@ -10,6 +10,10 @@ import (
 type Config struct {
 	BotToken      string `yaml:"bot_token"`
 	JoinChannelID string `yaml:"join_channel_id"`
+	TempParentID  string `yaml:"temp_parent_id"`
+	PositionRefID string `yaml:"position_ref_id"`
+	MaxChannels   int    `yaml:"max_channels"`
+	GracePeriod   int    `yaml:"grace_period"`
 }
 
 func MustLoad() *Config {

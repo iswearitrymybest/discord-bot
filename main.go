@@ -6,133 +6,246 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
 
-// Храним созданные временные каналы: ключ – ID канала, значение – ID гильдии
-var tempChannels = make(map[string]string)
+// TempChannelInfo хранит информацию о созданном временном голосовом канале.
+type TempChannelInfo struct {
+	GuildID   string
+	Number    int
+	CreatedAt time.Time
+}
+
+var (
+	// tempChannels: ключ – ID временного канала, значение – информация о канале.
+	tempChannels = make(map[string]TempChannelInfo)
+	// channelNumbers: для каждой гильдии хранится, какие номера уже заняты.
+	channelNumbers = make(map[string]map[int]bool)
+	mu             sync.Mutex
+)
 
 func main() {
+	// Загружаем конфигурацию из файла.
 	cfg := config.MustLoad()
-	log.Printf("Конфигурация загружена. JoinChannelID: %s", cfg.JoinChannelID)
+	log.Printf("Конфигурация загружена.\nBotToken: %s\nJoinChannelID: %s\nTempParentID: %s\nPositionRefID: %s\nMaxChannels: %d\nGracePeriod: %d сек",
+		cfg.BotToken, cfg.JoinChannelID, cfg.TempParentID, cfg.PositionRefID, cfg.MaxChannels, cfg.GracePeriod)
 
-	// Создаем новую сессию Discord
+	// Создаём новую сессию Discord.
 	dg, err := discordgo.New("Bot " + cfg.BotToken)
 	if err != nil {
-		log.Fatalf("Ошибка при создании сессии: %v", err)
+		log.Fatalf("Ошибка создания сессии: %v", err)
 	}
 
-	// Добавляем обработчик событий голосового состояния
-	dg.AddHandler(voiceStateUpdate)
-
-	// Включаем необходимые intents
+	// Устанавливаем необходимые интенты.
 	dg.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildVoiceStates
 
-	// Открываем websocket соединение с Discord
+	// Регистрируем обработчик обновлений голосового состояния.
+	dg.AddHandler(func(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) {
+		voiceStateHandler(s, vs, cfg)
+	})
+
+	// Открываем соединение.
 	err = dg.Open()
 	if err != nil {
-		log.Fatalf("Ошибка при открытии соединения: %v", err)
+		log.Fatalf("Ошибка открытия соединения: %v", err)
 	}
 	log.Println("Бот запущен и подключен к Discord. Ожидание событий...")
 
-	// Запускаем горутину для мониторинга временных каналов
-	go monitorTempChannels(dg)
+	// Запускаем горутину мониторинга временных каналов.
+	go monitorTempChannels(dg, cfg)
 
-	// Ожидаем завершения работы (CTRL-C)
+	// Ожидаем сигнала завершения.
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-sc
 
 	log.Println("Получен сигнал завершения, закрываем соединение...")
-	if err = dg.Close(); err != nil {
-		log.Printf("Ошибка при закрытии соединения: %v", err)
+	dg.Close()
+}
+
+// voiceStateHandler обрабатывает события обновления голосового состояния.
+func voiceStateHandler(s *discordgo.Session, vs *discordgo.VoiceStateUpdate, cfg *config.Config) {
+	// Логируем подробную информацию для отладки.
+	log.Printf("VoiceStateUpdate: UserID=%s, GuildID=%s, ChannelID=%q, BeforeUpdate=%+v",
+		vs.UserID, vs.GuildID, vs.ChannelID, vs.BeforeUpdate)
+
+	// Если пользователь вошёл в канал для создания временных каналов, то его ChannelID должен совпадать с JoinChannelID.
+	if vs.ChannelID != cfg.JoinChannelID {
+		return
+	}
+
+	log.Printf("Пользователь %s вошёл в канал создания (%s)", vs.UserID, cfg.JoinChannelID)
+	guildID := vs.GuildID
+
+	// Очистка устаревших записей временных каналов для данной гильдии.
+	mu.Lock()
+	for chanID, info := range tempChannels {
+		if info.GuildID == guildID {
+			if _, err := s.Channel(chanID); err != nil {
+				log.Printf("Очистка: удаляем устаревший канал %s", chanID)
+				delete(tempChannels, chanID)
+				if nums, ok := channelNumbers[info.GuildID]; ok {
+					delete(nums, info.Number)
+				}
+			}
+		}
+	}
+	// Подсчёт активных временных каналов.
+	count := 0
+	for _, info := range tempChannels {
+		if info.GuildID == guildID {
+			count++
+		}
+	}
+	if count >= cfg.MaxChannels {
+		mu.Unlock()
+		log.Println("❌ Достигнуто максимальное количество временных каналов!")
+		return
+	}
+	mu.Unlock()
+
+	log.Println("🔍 Вызываем getNextChannelNumber...")
+	number := getNextChannelNumber(guildID, cfg.MaxChannels)
+	if number == -1 {
+		log.Println("❌ Нет доступного номера для создания канала")
+		return
+	}
+
+	channelName := fmt.Sprintf("Водопойка №%d", number)
+	pos := getChannelPosition(s, guildID, cfg.PositionRefID)
+
+	newChannel, err := s.GuildChannelCreateComplex(guildID, discordgo.GuildChannelCreateData{
+		Name:     channelName,
+		Type:     discordgo.ChannelTypeGuildVoice,
+		ParentID: cfg.TempParentID,
+		Position: pos,
+	})
+	if err != nil {
+		log.Printf("❌ Ошибка создания временного канала: %v", err)
+		// Освобождаем номер в случае ошибки.
+		mu.Lock()
+		if nums, ok := channelNumbers[guildID]; ok {
+			delete(nums, number)
+		}
+		mu.Unlock()
+		return
+	}
+	log.Printf("✅ Создан временный канал: %s (№%d)", newChannel.ID, number)
+
+	// Сохраняем информацию о созданном канале.
+	mu.Lock()
+	if _, ok := channelNumbers[guildID]; !ok {
+		channelNumbers[guildID] = make(map[int]bool)
+	}
+	channelNumbers[guildID][number] = true
+	tempChannels[newChannel.ID] = TempChannelInfo{
+		GuildID:   guildID,
+		Number:    number,
+		CreatedAt: time.Now(),
+	}
+	mu.Unlock()
+
+	// Перемещаем пользователя в созданный канал.
+	err = s.GuildMemberMove(guildID, vs.UserID, &newChannel.ID)
+	if err != nil {
+		log.Printf("❌ Ошибка перемещения пользователя %s в канал %s: %v", vs.UserID, newChannel.ID, err)
+	} else {
+		log.Printf("✅ Пользователь %s перемещён в канал %s", vs.UserID, newChannel.ID)
 	}
 }
 
-// Обработчик обновления голосового состояния
-func voiceStateUpdate(s *discordgo.Session, vs *discordgo.VoiceStateUpdate) {
-	cfg := config.MustLoad()
-	log.Printf("Получено обновление голосового состояния: UserID=%s, GuildID=%s, ChannelID=%s", vs.UserID, vs.GuildID, vs.ChannelID)
-	// Если пользователь зашёл в канал для создания временного
-	if vs.ChannelID == cfg.JoinChannelID {
-		log.Printf("Пользователь %s вошёл в канал для создания временного канала", vs.UserID)
-		guildID := vs.GuildID
-
-		// Формируем имя нового канала
-		channelName := fmt.Sprintf("Временный канал - %s", vs.UserID)
-		newChannel, err := s.GuildChannelCreate(guildID, channelName, discordgo.ChannelTypeGuildVoice)
-		if err != nil {
-			log.Printf("Ошибка при создании голосового канала для пользователя %s: %v", vs.UserID, err)
-			return
-		}
-		log.Printf("Создан временный канал: %s для пользователя %s", newChannel.ID, vs.UserID)
-
-		// Сохраняем ID созданного канала
-		tempChannels[newChannel.ID] = guildID
-
-		// Перемещаем пользователя в новый канал
-		err = s.GuildMemberMove(guildID, vs.UserID, &newChannel.ID)
-		if err != nil {
-			log.Printf("Ошибка при перемещении пользователя %s в канал %s: %v", vs.UserID, newChannel.ID, err)
-			return
-		}
-		log.Printf("Пользователь %s перемещен в новый канал %s", vs.UserID, newChannel.ID)
+// getNextChannelNumber возвращает первый свободный номер для указанной гильдии.
+func getNextChannelNumber(guildID string, maxChannels int) int {
+	mu.Lock()
+	defer mu.Unlock()
+	if _, ok := channelNumbers[guildID]; !ok {
+		channelNumbers[guildID] = make(map[int]bool)
 	}
+	for i := 1; i <= maxChannels; i++ {
+		if !channelNumbers[guildID][i] {
+			// Отмечаем номер как занятый.
+			channelNumbers[guildID][i] = true
+			return i
+		}
+	}
+	return -1
 }
 
-// Горутина для периодической проверки временных каналов
-func monitorTempChannels(s *discordgo.Session) {
-	cfg := config.MustLoad()
-	log.Println("Запущена горутина для мониторинга временных каналов")
-	for {
-		time.Sleep(10 * time.Second)
-		for channelID, guildID := range tempChannels {
-			log.Printf("Проверка состояния канала %s в гильдии %s", channelID, guildID)
-			// Получаем информацию о канале
-			channel, err := s.Channel(channelID)
+// getChannelPosition возвращает позицию для нового канала относительно указанного канала.
+func getChannelPosition(s *discordgo.Session, guildID, refChannelID string) int {
+	ch, err := s.Channel(refChannelID)
+	if err != nil {
+		log.Printf("Ошибка получения позиции канала %s: %v", refChannelID, err)
+		return 0
+	}
+	return ch.Position + 1
+}
+
+// monitorTempChannels периодически проверяет временные каналы и удаляет пустые, если истёк период защиты.
+func monitorTempChannels(s *discordgo.Session, cfg *config.Config) {
+	// Интервал проверки задаём равным 10 секундам.
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	// Преобразуем время защиты из конфигурации (секунды) в duration.
+	gracePeriod := time.Duration(cfg.GracePeriod) * time.Second
+
+	for range ticker.C {
+		mu.Lock()
+		for chanID, info := range tempChannels {
+			// Если канал создан недавно – пропускаем проверку.
+			if time.Since(info.CreatedAt) < gracePeriod {
+				log.Printf("Канал %s находится в grace period", chanID)
+				continue
+			}
+
+			ch, err := s.Channel(chanID)
 			if err != nil {
-				log.Printf("Не удалось получить информацию о канале %s: %v. Удаляю его из списка.", channelID, err)
-				delete(tempChannels, channelID)
+				log.Printf("Не удалось получить информацию о канале %s: %v. Удаляем запись.", chanID, err)
+				delete(tempChannels, chanID)
+				if nums, ok := channelNumbers[info.GuildID]; ok {
+					delete(nums, info.Number)
+				}
 				continue
 			}
 
-			// Если канал не голосовой или это основной канал, пропускаем
-			if channel.Type != discordgo.ChannelTypeGuildVoice || channelID == cfg.JoinChannelID {
-				log.Printf("Канал %s пропущен: не голосовой или основной канал.", channelID)
+			if ch.Type != discordgo.ChannelTypeGuildVoice {
 				continue
 			}
 
-			// Получаем гильдию из состояния бота
-			guild, err := s.State.Guild(guildID)
+			guild, err := s.State.Guild(info.GuildID)
 			if err != nil {
-				log.Printf("Не удалось получить состояние гильдии %s: %v", guildID, err)
+				log.Printf("Ошибка получения гильдии %s: %v", info.GuildID, err)
 				continue
 			}
 
-			// Проверяем, есть ли участники в данном голосовом канале
 			empty := true
 			for _, vs := range guild.VoiceStates {
-				if vs.ChannelID == channelID {
+				if vs.ChannelID == chanID {
 					empty = false
-					log.Printf("Канал %s занят пользователем %s", channelID, vs.UserID)
 					break
 				}
 			}
 
-			// Если канал пустой, удаляем его
 			if empty {
-				log.Printf("Канал %s пуст, приступаем к удалению", channelID)
-				_, err = s.ChannelDelete(channelID)
+				log.Printf("Канал %s пуст. Удаляем.", chanID)
+				_, err = s.ChannelDelete(chanID)
 				if err != nil {
-					log.Printf("Ошибка при удалении временного канала %s: %v", channelID, err)
+					log.Printf("Ошибка удаления канала %s: %v", chanID, err)
 				} else {
-					log.Printf("Временный канал %s успешно удален", channelID)
-					delete(tempChannels, channelID)
+					log.Printf("Удалён временный канал %s", chanID)
+				}
+				delete(tempChannels, chanID)
+				if nums, ok := channelNumbers[info.GuildID]; ok {
+					delete(nums, info.Number)
 				}
 			}
 		}
+		log.Printf("Монитор: активных временных каналов – %d", len(tempChannels))
+		mu.Unlock()
 	}
 }
