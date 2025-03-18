@@ -1,0 +1,13 @@
+[Unit]
+Description=Discord Bot Service
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/root/discord-bot
+ExecStart=/root/discord-bot/bot --config config.yaml
+Restart=always
+RestartSec=4
+
+[Install]
+WantedBy=multi-user.target
